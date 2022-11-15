@@ -1,72 +1,84 @@
-// Created on: Nov 28, 2013
 /*
- * File : ch34x_pis.c
+ * ch341 multi-IO(Epp/MEM/I2C/SPI/GPIO) driver - Copyright (C) 2020 WCH Corporation.
+ * Author: TECH39 <zhangj@wch.cn>
  *
- **********************************************************************
- ***********	  Copyright (C) WCH 2013.11.28		***************
- ***********	      web: www.wch.cn			***************
- ***********	  AUTHOR: TECH33 (tech@wch.cn)		***************
- ***********	 Used for USB Interface Chip (CH341)	***************
- ***********	Nanjing	QinHeng Electronics Co.,Ltd	***************
- **********************************************************************
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
  *
- * Running Environment: Linux
- * This file is used for CH34x in Epp/MEM/I2C/SPI
+ * Version: V1.05
  *
+ * Update Log:
+ * V1.00 - initial version
+ * V1.04 - fixed ioctls bugs when copy data from user space
+ * V1.05 - fixed write & read & ioctls bugs
+ * V1.06 - add CH347 support
  */
-#include <linux/module.h>
+ 
 #include <linux/kernel.h>
 #include <linux/errno.h>
-#include <linux/mutex.h>
-#include <linux/errno.h>
-#include <linux/poll.h>
+#include <linux/init.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
+#include <linux/mm.h>
+#include <linux/kref.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/usb.h>
-
 #include <linux/version.h>
+
 #ifndef KERNEL_VERSION
 #define KERNEL_VERSION(ver, rel, seq) 	((ver << 16) | (rel <<8) | (seq))
 #endif
 
-#define DEBUG
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(4, 12, 0))
+	#include <asm/uaccess.h>
+#else
+	#include <linux/uaccess.h>
+#endif
+
+#define DEBUG 1
 //#undef DEBUG
 
 #ifdef DEBUG
-#define dbg( format, arg... )	\
-    printk( KERN_DEBUG "%s %d: " format "\n", __FILE__, __LINE__, ##arg )
+#define dbg(format, arg...)	\
+    printk(KERN_DEBUG ""format "\n", ## arg)
 #else
 #define dbg( format, arg... )	do{} while(0)
 #endif
 
 #define err( format, arg... )	\
-    printk( KERN_ERR KBUILD_MODNAME ":" format "\n", __FILE__, __LINE__, ##arg)
+    printk( KERN_ERR "%s %d:" format "\n", __FILE__, __LINE__, ##arg)
 
 
-#define CH34x_VENDOR_ID		0x1A86	//Vendor Id
+#define CH34x_VENDOR_ID			0x1A86	//Vendor Id
 #define CH34x_PRODUCT_ID		0x5512	//Product Id
-#define DRV_NAME    			       "ch34x_pis"
-#define DRV_VERSION	    			"WCH CH34x Driver Version V0.1"
+#define DRV_NAME    			"ch34x_pis"
+#define DRV_VERSION	    		"WCH CH34x Driver Version V1.05"
+    
+#define DRIVER_AUTHOR "TECH39"
+#define DRIVER_DESC   "Multi-IO driver for usb to multi interface chip ch341."
+#define VERSION_DESC  "V1.06 On 2022.03.05"
 
 
 #define CH34x_MINOR_BASE		200	//
 #define WRITES_IN_FLIGHT		8
 #define CH34x_READ_SHORT		8
-#define CH34x_PACKET_LENGTH	32
+#define CH34x_PACKET_LENGTH		32
+#define CH347_PACKET_LENGTH		512
 #define MAX_BUFFER_LENGTH		0x1000
-
 
 //Vendor define
 #define VENDOR_WRITE_TYPE		0x40	//vendor write command
 #define VENDOR_READ_TYPE		0XC0	//vendor read command
 
 //
-#define CH34x_PARA_INIT		0xB1		// Init Parallel	
-#define CH34x_I2C_STATUS		0x52      //get I2C status
+#define CH34x_PARA_INIT			0xB1	// Init Parallel	
+#define CH34x_I2C_STATUS		0x52    //get I2C status
 #define CH34x_I2C_COMMAND		0x53	//send I2C command
 
-#define CH34x_BUF_CLEAR             0xB2	//clear uncompleted data
-#define CH34x_I2C_CMD_X		0x54	//send I2C command
+#define CH34x_BUF_CLEAR         0xB2	//clear uncompleted data
+#define CH34x_I2C_CMD_X			0x54	//send I2C command
 #define CH34x_DELAY_MS			0x5E
 #define VENDOR_VERSION 			0x5F	//get version of chip
 
@@ -74,17 +86,16 @@
 #define CH34x_PARA_CMD_R1		0xAD	//read data1 from Para
 #define CH34x_PARA_CMD_W0		0xA6	//write data0 to Para
 #define CH34x_PARA_CMD_W1		0xA7	//write data1 to Para
-#define CH34x_PARA_CMD_STS	0xA0	//get status of Para
-
+#define CH34x_PARA_CMD_STS		0xA0	//get status of Para
 
 //CH341 COMMAND
-#define CH34x_CMD_SET_OUTPUT		0xA1	//set Para output
-#define CH34x_CMD_IO_ADDR			0xA2	//MEM IO Addr
+#define CH34x_CMD_SET_OUTPUT	0xA1	//set Para output
+#define CH34x_CMD_IO_ADDR		0xA2	//MEM IO Addr
 #define CH34x_CMD_PRINT_OUT		0xA3	//print output
-#define CH34X_CMD_SPI_STREAM		0xA8	//SPI command
-#define CH34x_CMD_SIO_STREAM		0xA9	//SIO command
-#define CH34x_CMD_I2C_STREAM		0xAA	//I2C command
-#define CH34x_CMD_UIO_STREAM		0xAB	//UIO command
+#define CH34X_CMD_SPI_STREAM	0xA8	//SPI command
+#define CH34x_CMD_SIO_STREAM	0xA9	//SIO command
+#define CH34x_CMD_I2C_STREAM	0xAA	//I2C command
+#define CH34x_CMD_UIO_STREAM	0xAB	//UIO command
 
 #define	CH341A_CMD_UIO_STM_IN	0x00	 // UIO Interface In ( D0 ~ D7 )
 #define	CH341A_CMD_UIO_STM_DIR	0x40	 // UIO interface Dir( set dir of D0~D5 )
@@ -92,8 +103,17 @@
 #define	CH341A_CMD_UIO_STM_US	0xC0	 // UIO Interface Delay Command( us )
 #define	CH341A_CMD_UIO_STM_END	0x20	 // UIO Interface End Command
 
+// add CH347 CMD
+#define MODE1_INTERFACE_NUM		0x02
+
+#define USB20_CMD_UART1_INIT    0xCB	// 串口1初始化,用于串口1初始化
+#define USB20_CMD_GPIO_OP       0xCC	// GPIO口操作,用于GPIO口控制操作
+#define USB20_CMD_JUMP_IAP      0xCD	// 跳转进入IAP,用于控制跳转进入IAP模式
+#define USB20_CMD_BIT_STREAM    0xDA	// GPIO数据流输入输出控制命令
+
 //Single read/write the MAX number of blocks in EPP/MEM
-#define CH34x_EPP_IO_MAX			( CH34x_PACKET_LENGTH - 1 )
+//#define CH34x_EPP_IO_MAX			( CH34x_PACKET_LENGTH - 1 )
+#define CH34x_EPP_IO_MAX			( CH347_PACKET_LENGTH )
 //CH341A
 #define CH34xA_EPP_IO_MAX			0xFF
 
@@ -105,16 +125,16 @@
 #define REQUEST_TYPE_WRITE		( USB_DIR_OUT | USB_TYPE_VENDOR |USB_RECIP_OTHER)
 
 //Ioctl cmd Codes
-#define CH34x_GET_DRV_VERSION			0x00000001
-#define CH34x_CHIP_VERSION				0x00000003
-#define CH34x_FUNCTION_SETPARA_MODE	0x00000004
-#define CH34x_FUNCTION_READ_MODE		0x00000005
-#define CH34x_FUNCTION_WRITE_MODE	0x00000006
-#define CH34x_I2C_READ_MODE			0x00000007
-#define CH34x_I2C_WRITE_MODE			0x00000008
-#define CH34x_PIPE_DATA_DOWN			0x00000009
-#define CH34x_PIPE_WRITE_READ			0x0000000a
-#define CH34x_PIPE_DEVICE_CTRL			0x0000000b
+#define CH34x_GET_DRV_VERSION		0x80000001
+#define CH34x_CHIP_VERSION			0x80000003
+#define CH34x_FUNCTION_SETPARA_MODE	0x80000004
+#define CH34x_FUNCTION_READ_MODE	0x80000005
+#define CH34x_FUNCTION_WRITE_MODE	0x80000006
+#define CH34x_I2C_READ_MODE			0x80000007
+#define CH34x_I2C_WRITE_MODE		0x80000008
+#define CH34x_PIPE_DATA_DOWN		0x80000009
+#define CH34x_PIPE_WRITE_READ		0x8000000a
+#define CH34x_PIPE_DEVICE_CTRL		0x8000000b
 
 
 static unsigned char Read_Mode;	//Read Data Pipe Mode From Para
@@ -149,12 +169,6 @@ struct ch34x_pis{
 static struct usb_driver ch34x_pis_driver;
 static void skel_delete( struct kref *kref );
 
-struct ReadWriteUserData{
-		unsigned long oReadlen;
-		unsigned long iBuf;	
-		unsigned long oBuffer;
-		unsigned long oReturnlen;
-};
 
 static DEFINE_MUTEX( io_mutex );
 
@@ -162,7 +176,9 @@ static DEFINE_MUTEX( io_mutex );
 static struct usb_device_id ch34x_usb_ids[] =
 {
     { USB_DEVICE(CH34x_VENDOR_ID, CH34x_PRODUCT_ID) },
-    { }
+    { USB_DEVICE_INTERFACE_NUMBER(0x1A86, 0x55DB, MODE1_INTERFACE_NUM) },		// CH347 Mode1 SPI+IIC+UART
+	{ USB_DEVICE(0x1A86, 0x55DD) },		// CH347 Mode3 JTAG+UART
+	{}
 };
 
 MODULE_DEVICE_TABLE(usb, ch34x_usb_ids);
@@ -192,8 +208,8 @@ static int ch34x_func_read( __u8 request, __u16 value, __u16 index,
 {
 	int retval;
 	/*Control Transform -->usb_control_msg */
-	retval = usb_control_msg(dev->udev, usb_rcvctrlpipe(dev->udev, 0),
-							 request, VENDOR_READ_TYPE, value, index, buf, len, 1000);
+	retval = usb_control_msg( dev->udev, usb_rcvctrlpipe( dev->udev, 0 ), 
+		request, VENDOR_READ_TYPE, value, index, buf, len, 1000);
 
 	dbg( "VENDOR_READ_TYPE: 0x%x : 0x%x : 0x%x %d - %d", request,
 		value, index, retval, len );
@@ -268,91 +284,97 @@ ssize_t ch34x_fops_read(struct file *file, char __user *to_user,
 	size_t count, loff_t *file_pos)
 {
 	struct ch34x_pis *dev;
-	unsigned char mBuffer[4];
+	unsigned char mBuffer[4], *temp;
 	int retval, i;
 	int j = 0;
 	unsigned long bytes_read, mNewlen;
 	int Returnlen;
 	unsigned long Bytes, totallen = 0;
 
+	temp = kmalloc(2, GFP_KERNEL);
+	if (!temp)
+		return -ENOMEM;
+
 	dev = (struct ch34x_pis *)file->private_data;
 	if( count == 0 || count > MAX_BUFFER_LENGTH )
 	{
-		return count;		
-	} 
-	bytes_read = ( dev->VenIc >= 0x20 )?( CH34xA_EPP_IO_MAX - 
-		(CH34xA_EPP_IO_MAX & ( CH34x_PACKET_LENGTH - 1 ))): CH34x_EPP_IO_MAX;
+		kfree(temp);
+		return count;
+	}
+	// bytes_read = ( dev->VenIc >= 0x20 )?( CH34xA_EPP_IO_MAX - 
+	// 	(CH34xA_EPP_IO_MAX & ( CH34x_PACKET_LENGTH - 1 ))): CH34x_EPP_IO_MAX;
 	
+	bytes_read = (count > CH347_PACKET_LENGTH) ? CH347_PACKET_LENGTH : count;
+
+	// bytes_read = CH347_PACKET_LENGTH;
+
 	mNewlen = count / bytes_read;
-	mBuffer[0] = mBuffer[2] = Read_Mode;
+	temp[0] = mBuffer[0] = mBuffer[2] = Read_Mode;
 	mBuffer[1] = ( unsigned char )bytes_read;
 	mBuffer[3] = ( unsigned char )( count - mNewlen * bytes_read );
-	dbg("count %d,->bytes_read %d,->mNewlen %d,->mBuffer[0] %d,->[1] %d,->[2]%d,->[3]%d",count,bytes_read,mNewlen,mBuffer[0],mBuffer[1],mBuffer[2],mBuffer[3]);
+	dbg("count %d,->bytes_read %ld,->mNewlen %ld,->mBuffer[0] %d,->[1] %d,->[2]%d,->[3]%d",
+		(int)count, bytes_read, mNewlen, mBuffer[0], mBuffer[1], mBuffer[2], mBuffer[3]);
+		
+	// if( mBuffer[3] )
+	// 	mNewlen++;
 	
-	if( mBuffer[3] )
-		mNewlen++;
 	mutex_lock( &io_mutex );
 	if( !dev->interface )
 	{
 		retval = -ENODEV;
+		mutex_unlock( &io_mutex );
 		goto exit;
 	}
 	mutex_unlock( &io_mutex );
-
 	
-	dev->bulk_in_buffer = kmalloc( sizeof( unsigned char ) * count, GFP_KERNEL );
-	if( dev->bulk_in_buffer == NULL )
-	{
-		err("bulk_in_buffer malloc error");
-		retval = -ENOMEM;
-		goto exit;  
-	}
+	printk("mNewLen:%d\n", mNewlen);
 	for( i = 0; i < mNewlen; i++ )
 	{
-		if( (i + 1) == mNewlen && mBuffer[3] )
-		{
-			j = 2;
-			Bytes = mBuffer[3];
-		}
-		else
-		{
-			j = 0;
+		// if( (i + 1) == mNewlen && mBuffer[3] )
+		// {
+		// 	temp[1] = mBuffer[3];
+		// 	Bytes = mBuffer[3];
+		// }
+		// else
+		// {
+			temp[1] = mBuffer[1];
 			Bytes = bytes_read;
-		}
-		mutex_lock( &io_mutex );
-		retval = usb_bulk_msg( dev->udev, usb_sndbulkpipe( dev->udev, 
-			dev->bulk_out_endpointAddr ), mBuffer + j, 0x02, NULL, 10000);
-		if( retval )
+		// }
+		printk("Bytes:%d\n", Bytes);
+
+		dev->bulk_in_buffer = kmalloc( sizeof( unsigned char ) * Bytes, GFP_KERNEL );
+		if( dev->bulk_in_buffer == NULL )
 		{
-			retval = -EFAULT;
-			mutex_unlock( &io_mutex );
-			err("usb_bulk_msg out error");
-			goto exit;
+			err("bulk_in_buffer malloc error");
+			retval = -ENOMEM;
+			goto exit;	
 		}
-		mutex_unlock( &io_mutex );
+
 		mutex_lock( &io_mutex );
 		retval = usb_bulk_msg( dev->udev, usb_rcvbulkpipe( dev->udev,
 				dev->bulk_in_endpointAddr ), 
-				dev->bulk_in_buffer + i * bytes_read, 
-						Bytes, &Returnlen, 10000 );
+				dev->bulk_in_buffer, 
+				Bytes, &Returnlen, 1000 );
 	
 		if( retval )
 		{
 			retval = -EFAULT;
 			mutex_unlock( &io_mutex );
+			kfree( dev->bulk_in_buffer );
 			err("usb_bulk_msg in error");
 			goto exit;
 		}	
 		mutex_unlock( &io_mutex );
+		copy_to_user( to_user + totallen, dev->bulk_in_buffer, Returnlen );
 		totallen += Returnlen;
+		
+		printk("totallen:%d, Returnlen:%d\n", totallen, Returnlen);
+		kfree( dev->bulk_in_buffer );
 	}
-	
-	if( copy_to_user( to_user, dev->bulk_in_buffer, totallen ))
-		retval = -EFAULT;
-	else
-		retval = totallen;		
-	kfree( dev->bulk_in_buffer );
-exit:	
+	kfree(temp);
+	return totallen;
+exit:
+	kfree(temp);
 	return retval;
 }
 
@@ -369,7 +391,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 	unsigned long mLength, mNewlen, mReturn = 0;	
 	unsigned long write_size;
 
-	dev = (struct ch34x_pis *)file->private_data;		
+	dev = (struct ch34x_pis *)file->private_data;	
 	if( count == 0 )
 		goto exit;
 	else if( count > MAX_BUFFER_LENGTH )
@@ -390,22 +412,23 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 		
 	mNewlen = count / CH34x_EPP_IO_MAX;
 	mLength = count - mNewlen * CH34x_EPP_IO_MAX;
-	mNewlen *= CH34x_PACKET_LENGTH;
-	buf = (char *)kmalloc( sizeof(unsigned char) * (mNewlen + mLength), GFP_KERNEL );
+	// mNewlen *= CH34x_PACKET_LENGTH;
+	mNewlen *= CH347_PACKET_LENGTH;
+	buf = (char *)kmalloc( sizeof(unsigned char) * 4096, GFP_KERNEL );
 	mutex_lock( &io_mutex );
-	for( i = 0; i < mNewlen; i += CH34x_PACKET_LENGTH )
+	// for( i = 0; i < mNewlen; i += CH34x_PACKET_LENGTH )
+	for( i = 0; i < mNewlen; i += CH347_PACKET_LENGTH )
 	{
-		buf[i] = Write_Mode;
-		memcpy( buf + i + 1, user_buffer + mReturn, CH34x_EPP_IO_MAX );
+		copy_from_user( buf + i, user_buffer + mReturn, CH34x_EPP_IO_MAX );
 		mReturn += CH34x_EPP_IO_MAX;
 	}
 	if( mLength )
 	{
-		buf[i] = Write_Mode;
-		memcpy( buf + i + 1, user_buffer + mReturn, mLength );
-		mNewlen += mLength + 1 ;
+		copy_from_user( buf + i, user_buffer + mReturn, mLength );
+		mNewlen += mLength;
 	}
 	mutex_unlock( &io_mutex );
+
 	if( mNewlen > MAX_BUFFER_LENGTH )
 	{
 		
@@ -430,11 +453,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 			goto error;
 		}	
 		
-		if( copy_from_user( WriteBuf, buf, write_size ))
-		{
-			retval = -EFAULT;
-			goto error;
-		}
+		memcpy(WriteBuf, buf, write_size);
 		
 		mutex_lock( &io_mutex );
 		if( !dev->interface )
@@ -464,6 +483,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 	}
 	else
 		mLength = mNewlen;
+	
 	write_size = mLength;
 	
 	urb = usb_alloc_urb( 0, GFP_KERNEL );
@@ -472,7 +492,6 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 		return -ENOMEM;
 		goto error;
 	}
-
 #if( LINUX_VERSION_CODE < KERNEL_VERSION( 2, 6, 35) )
 	WriteBuf = usb_buffer_alloc( dev->udev, write_size, 
 		GFP_KERNEL, &urb->transfer_dma );
@@ -486,12 +505,8 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 		goto error;
 	}
 
-	if( __copy_from_user( WriteBuf + ( mNewlen - mLength), (unsigned char __user*)buf + (mNewlen - mLength), mLength ))
-	{
-		retval = -EFAULT;
-		dbg("copy_from_user error");
-		goto error;
-	}
+	memcpy( WriteBuf, buf + (mNewlen - mLength), mLength );
+
 	mutex_lock( &io_mutex );
 	if( !dev->interface )
 	{
@@ -501,7 +516,7 @@ ssize_t ch34x_fops_write(struct file *file, const char __user *user_buffer,
 	}
 	/*initialize urb*/
 	usb_fill_bulk_urb( urb, dev->udev, usb_sndbulkpipe( dev->udev,
-			dev->bulk_out_endpointAddr ), WriteBuf + (mNewlen - mLength), 
+			dev->bulk_out_endpointAddr ), WriteBuf, 
 			write_size, ch34x_write_bulk_callback, dev );
 
 	urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
@@ -532,6 +547,7 @@ error:
 #endif
 		usb_free_urb( urb );
 	}
+	kfree( buf );
 exit:
 	return retval;
 	
@@ -600,6 +616,7 @@ static int ch34x_WriteData( unsigned long iLength, unsigned long iBuffer,
 		goto error;
 	}
 	
+
 	/* initialize the urb properly */
 	usb_fill_bulk_urb( urb, dev->udev, usb_sndbulkpipe( dev->udev, 
 			dev->bulk_out_endpointAddr ), WriteBuf, length,
@@ -616,7 +633,6 @@ static int ch34x_WriteData( unsigned long iLength, unsigned long iBuffer,
 			__func__, retval, __LINE__ );
 		goto error_unanchor;
 	}
-	
 	/*release our reference to this urb*/
 	usb_free_urb( urb );
 	return length;
@@ -653,7 +669,8 @@ static int ch34x_data_write_read( unsigned long iLength, unsigned long iBuffer,
 	int i, mSave;		// the number of data in a block
 	int readtimes;
 	int retval = 0;
-	dbg("iLength is %d",iLength );
+
+	dbg("iLength is %ld\n",iLength);
 	if( iLength < 8 || iLength > MAX_BUFFER_LENGTH + 8 )
 	{
 		err(" The length input error");
@@ -741,7 +758,7 @@ static int ch34x_data_write_read( unsigned long iLength, unsigned long iBuffer,
 	usb_free_urb( iUrb );
 // Read Urb Data
 	totallen = mSave * readtimes;
-	dbg("mSave : %d, readtimes : %d, totallen : %d", mSave, readtimes, totallen);
+	dbg("mSave : %d, readtimes : %d, totallen : %ld\n", mSave, readtimes, totallen);
 	oBuf = kmalloc( sizeof( unsigned char ) * totallen, GFP_KERNEL );
 	totallen = 0;
 	for( i = 0; i < readtimes; i++ )
@@ -754,7 +771,7 @@ static int ch34x_data_write_read( unsigned long iLength, unsigned long iBuffer,
 		totallen += bytes_read;
 		mutex_unlock( &io_mutex );
 	}
-	dbg("The actual length of Read is %d", totallen);
+	dbg("The actual length of Read is %ld", totallen);
 	/*if the read is sucessful,copy the data to userspace*/
 	if( copy_to_user((char __user *)oBuffer, oBuf, totallen))
 	{
@@ -837,9 +854,8 @@ int ch34x_fops_open(struct inode *inode, struct file *file)
 			mutex_unlock( &io_mutex );
 			kref_put( &ch34x_p->kref, skel_delete );
 			goto exit;
-		}
+		} 
 	}
-
 	file->private_data = ch34x_p;
 	mutex_unlock( &io_mutex );
 
@@ -855,23 +871,25 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 	unsigned long ch34x_arg )
 #endif
 {
-	int err = 0;
 	int retval = 0;
-	//char buf[2];
 	char *buf;
 	unsigned long bytes_read;
 	unsigned long bytes_write;
 	char *drv_version_tmp = DRV_VERSION;
 	struct ch34x_pis *ch34x_pis_tmp;
-	void __user *data;
-	struct ReadWriteUserData rwData;
+	unsigned long arg1, arg2, arg3, arg4;
+
+	buf = kmalloc(2, GFP_KERNEL);
+	if (!buf) {
+		err("No memory!");
+		return -EFAULT;
+	}
 
 	ch34x_pis_tmp = ( struct ch34x_pis *)file->private_data;
 	if( ch34x_pis_tmp == NULL )
 	{
 		return -ENODEV;
 	}
-
 	switch( ch34x_cmd )
 	{
 		case CH34x_GET_DRV_VERSION:
@@ -883,17 +901,13 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 			}
 		case CH34x_CHIP_VERSION:
 			{
-				buf = kmalloc(2, GFP_KERNEL);
-				if (!buf)
-					return -ENOMEM;
 				retval = ch34x_func_read( VENDOR_VERSION, 
-				0x0000, 0x0000, ch34x_pis_tmp, buf, 0x02 );			
+					0x0000, 0x0000, ch34x_pis_tmp, buf, 0x02 );			
 				
 				retval = copy_to_user( (char __user *)( ch34x_arg ),
 					(char *)buf, 0x02 );	
-				ch34x_pis_tmp->VenIc = buf[1] << 8 | buf[0];
-				dbg("------> 2 Chip Version is sucessful 0x%02x%02x", buf[1],buf[0]);
-				kfree(buf);
+				ch34x_pis_tmp->VenIc = *(buf + 1) << 8 | *buf;
+				dbg("------> 2 Chip Version is sucessful 0x%02x%x", *(buf + 1), *buf);
 				break;
 			}
 		case CH34x_FUNCTION_SETPARA_MODE:
@@ -903,12 +917,13 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 					ch34x_pis_tmp, NULL, 0x00 );
 				if( retval != 0 )
 					err("CH34x_FUNCTION_SETPARA_MODE Error");
-				dbg("------>SetParaMode - ch34x_arg %x", ch34x_arg);
+				dbg("------>SetParaMode - ch34x_arg 0x%lx", ch34x_arg);
 				break;
 			}
 		case CH34x_FUNCTION_READ_MODE:
 			{
-				if( ch34x_arg )
+				get_user( arg1, (long __user *)ch34x_arg);
+				if( arg1 )
 					Read_Mode = CH34x_PARA_CMD_R1;
 				else
 					Read_Mode = CH34x_PARA_CMD_R0;
@@ -918,7 +933,8 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 			}
 		case CH34x_FUNCTION_WRITE_MODE:
 			{
-				if( ch34x_arg )
+				get_user( arg1, (long __user *)ch34x_arg);
+				if( arg1 )
 					Write_Mode = CH34x_PARA_CMD_W1;
 				else
 					Write_Mode = CH34x_PARA_CMD_W0;
@@ -937,52 +953,42 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 		case CH34x_PIPE_DATA_DOWN:	
 			{
 				dbg("------> Use Pipe Data Down");
-				data = (void __user *) ch34x_arg;
-				if (data == NULL)
-					break;
-				if (copy_from_user(&rwData, data, sizeof(struct ReadWriteUserData))) {
-					retval = -EFAULT;
-					break;
-				}
-				if (copy_from_user(&bytes_write, rwData.oReadlen, sizeof(bytes_write) ) ){
-					retval = -EFAULT;
-					break;
-				}
+				get_user( arg1, (long __user *)ch34x_arg);
+				get_user( arg2, ((long __user *)ch34x_arg + 1));
+				get_user( bytes_write, (long __user *)arg1);
 				dbg("------> length :%ld", bytes_write);
 				retval = ch34x_WriteData( bytes_write,        
-							rwData.iBuf,
+							arg2,
 							ch34x_pis_tmp );
 
 				break;
 			}
 		case CH34x_PIPE_WRITE_READ:
 			{	
-				unsigned long addr;
 				dbg("------> Use Pipe Date Write/Read");
-				data = (void __user *) ch34x_arg;
-				if (data == NULL)
-					break;
-				if (copy_from_user(&rwData, data, sizeof(struct ReadWriteUserData))) {
-					retval = -EFAULT;
-					break;
-				}
-				dbg("Input number is %d",rwData.oReadlen);
-				bytes_read = ch34x_data_write_read(rwData.oReadlen,	rwData.iBuf,
-						rwData.oBuffer,ch34x_pis_tmp );
+
+				get_user( arg1, (long __user *)ch34x_arg);
+				get_user( arg2, ((long __user *)ch34x_arg + 1));
+				get_user( arg3, ((long __user *)ch34x_arg + 2));
+				get_user( arg4, ((long __user *)ch34x_arg + 3));
+
+				dbg("Input number is %ld\n", arg1);	
+				bytes_read = ch34x_data_write_read( arg1,
+						arg2, arg3, ch34x_pis_tmp );
 				if( bytes_read <= 0 )
 				{
 					err("Read Error");
 					return -EFAULT;
 				}
-				dbg("Read bytes is %d", bytes_read);	
-				// retval = put_user( bytes_read, (long __user *)(*(((long *)ch34x_arg) + 3)));
-				retval = copy_to_user(rwData.oReturnlen,  &bytes_read,sizeof(unsigned long));
-
+				dbg("Read bytes is %ld", bytes_read);	
+				retval = put_user( bytes_read, (long __user *)arg4);
+					
 				break;
 			}
 		case CH34x_PIPE_DEVICE_CTRL:
 			{
-				retval = CH34xInitParallel( (unsigned char)ch34x_arg, ch34x_pis_tmp );
+				get_user(arg1, (long __user *)ch34x_arg);
+				retval = CH34xInitParallel((u8)arg1, ch34x_pis_tmp);
 				if( retval < 0 )
 				{
 					err("Init Parallel Error");
@@ -995,14 +1001,14 @@ long ch34x_fops_ioctl( struct file *file, unsigned int ch34x_cmd,
 			break;
 	}	
 
-	
+	kfree(buf);
 	return 0;
 }
 
 static const struct file_operations ch34x_fops_driver = {
 	.owner		= THIS_MODULE,
 	.open		= ch34x_fops_open,
-	.release		= ch34x_fops_release,
+	.release	= ch34x_fops_release,
 	.read		= ch34x_fops_read,
 	.write		= ch34x_fops_write,
 #if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,35))
@@ -1060,7 +1066,7 @@ static int ch34x_pis_probe( struct usb_interface *intf, const
 		endpoint = &hinterface->endpoint[i].desc;
 		
 		if(( endpoint->bEndpointAddress & USB_DIR_IN ) &&
-		  ( endpoint->bmAttributes & 3 ) == 0x02 ) 
+			 ( endpoint->bmAttributes & 2 ) == 0x02 ) 
 		{
 			dbg("Found a bulk in endpoint");
 			buffer_size = le16_to_cpu( endpoint->wMaxPacketSize );
@@ -1069,7 +1075,7 @@ static int ch34x_pis_probe( struct usb_interface *intf, const
 		}
 		
 		if((( endpoint->bEndpointAddress & USB_DIR_IN ) == 0x00 ) &&
-		  ( endpoint->bmAttributes & 3 ) == 0x02 )
+		  ( endpoint->bmAttributes & 2 ) == 0x02 )
 		{
 			dbg("Found a bulk out endpoint");
 			ch34x_p->bulk_out_endpointAddr = endpoint->bEndpointAddress;
@@ -1175,7 +1181,7 @@ static struct usb_driver ch34x_pis_driver = {
 	.name  		= DRV_NAME,
 	.probe		= ch34x_pis_probe,
 	.disconnect	= ch34x_pis_disconnect,
-	.suspend	       = ch34x_pis_suspend,
+	.suspend	= ch34x_pis_suspend,
 	.resume		= ch34x_pis_resume,
 	.pre_reset	= ch34x_pre_reset,
 	.post_reset	= ch34x_post_reset,
@@ -1186,6 +1192,9 @@ static struct usb_driver ch34x_pis_driver = {
 static int __init ch34x_pis_init(void)
 {
 	int retval;
+
+	printk(KERN_INFO KBUILD_MODNAME ": " DRIVER_DESC "\n");
+	printk(KERN_INFO KBUILD_MODNAME ": " VERSION_DESC "\n");
 	retval = usb_register( &ch34x_pis_driver );
 	if( retval )
 		printk( KERN_INFO "CH34x Device Register Failed.\n" );
@@ -1194,11 +1203,13 @@ static int __init ch34x_pis_init(void)
 
 static void __exit ch34x_pis_exit(void)
 {
+	printk(KERN_INFO KBUILD_MODNAME ": " "ch34x driver exit.\n");
 	usb_deregister(&ch34x_pis_driver);
 }
 
 module_init(ch34x_pis_init);
 module_exit(ch34x_pis_exit);
-MODULE_AUTHOR("WCH TECH GRP");
-MODULE_DESCRIPTION("WCH CH34x Chip Driver");
+
+MODULE_AUTHOR(DRIVER_AUTHOR);
+MODULE_DESCRIPTION(DRIVER_DESC);
 MODULE_LICENSE("GPL");
